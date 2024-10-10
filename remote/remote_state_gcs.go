@@ -19,7 +19,6 @@ import (
 	"github.com/gruntwork-io/terragrunt/util"
 	"github.com/mitchellh/mapstructure"
 	"golang.org/x/oauth2"
-	"golang.org/x/oauth2/jwt"
 	"google.golang.org/api/option"
 )
 
@@ -63,14 +62,6 @@ type RemoteStateConfigGCS struct {
 
 	ImpersonateServiceAccount          string   `mapstructure:"impersonate_service_account"`
 	ImpersonateServiceAccountDelegates []string `mapstructure:"impersonate_service_account_delegates"`
-}
-
-// accountFile represents the structure of the Google account file JSON file.
-type accountFile struct {
-	PrivateKeyID string `json:"private_key_id"`
-	PrivateKey   string `json:"private_key"`
-	ClientEmail  string `json:"client_email"`
-	ClientID     string `json:"client_id"`
 }
 
 const MaxRetriesWaitingForGcsBucket = 12
@@ -540,21 +531,21 @@ type BucketHandle interface {
 // CreateGCSClient creates an authenticated client for GCS
 func CreateGCSClient(ctx context.Context, gcsConfigRemote RemoteStateConfigGCS) (*storage.Client, error) {
 	var opts []option.ClientOption
+	var credOpts []option.ClientOption
 
 	if gcsConfigRemote.Credentials != "" {
-		opts = append(opts, option.WithCredentialsFile(gcsConfigRemote.Credentials))
+		credOpts = append(credOpts, option.WithCredentialsFile(gcsConfigRemote.Credentials))
 	} else if gcsConfigRemote.AccessToken != "" {
 		tokenSource := oauth2.StaticTokenSource(&oauth2.Token{
 			AccessToken: gcsConfigRemote.AccessToken,
 		})
-		opts = append(opts, option.WithTokenSource(tokenSource))
+		credOpts = append(credOpts, option.WithTokenSource(tokenSource))
 	} else if oauthAccessToken := os.Getenv("GOOGLE_OAUTH_ACCESS_TOKEN"); oauthAccessToken != "" {
 		tokenSource := oauth2.StaticTokenSource(&oauth2.Token{
 			AccessToken: oauthAccessToken,
 		})
-		opts = append(opts, option.WithTokenSource(tokenSource))
+		credOpts = append(credOpts, option.WithTokenSource(tokenSource))
 	} else if os.Getenv("GOOGLE_CREDENTIALS") != "" {
-		var account accountFile
 		// to mirror how Terraform works, we have to accept either the file path or the contents
 		creds := os.Getenv("GOOGLE_CREDENTIALS")
 
@@ -563,23 +554,11 @@ func CreateGCSClient(ctx context.Context, gcsConfigRemote RemoteStateConfigGCS) 
 			return nil, fmt.Errorf("Error loading credentials: %w", err)
 		}
 
-		if err := json.Unmarshal([]byte(contents), &account); err != nil {
+		if !json.Valid([]byte(contents)) {
 			return nil, fmt.Errorf("Error parsing credentials '%s': %w", contents, err)
 		}
 
-		if err := json.Unmarshal([]byte(contents), &account); err != nil {
-			return nil, fmt.Errorf("Error parsing credentials '%s': %w", contents, err)
-		}
-
-		conf := jwt.Config{
-			Email:      account.ClientEmail,
-			PrivateKey: []byte(account.PrivateKey),
-			// We need the FullControl scope to be able to add metadata such as labels
-			Scopes:   []string{storage.ScopeFullControl},
-			TokenURL: "https://oauth2.googleapis.com/token",
-		}
-
-		opts = append(opts, option.WithHTTPClient(conf.Client(ctx)))
+		credOpts = append(credOpts, option.WithCredentialsJSON([]byte(contents)))
 	}
 
 	if gcsConfigRemote.ImpersonateServiceAccount != "" {
@@ -587,12 +566,14 @@ func CreateGCSClient(ctx context.Context, gcsConfigRemote RemoteStateConfigGCS) 
 			TargetPrincipal: gcsConfigRemote.ImpersonateServiceAccount,
 			Scopes:          []string{storage.ScopeFullControl},
 			Delegates:       gcsConfigRemote.ImpersonateServiceAccountDelegates,
-		})
+		}, credOpts...)
 		if err != nil {
 			return nil, err
 		}
 
 		opts = append(opts, option.WithTokenSource(ts))
+	} else {
+		opts = append(opts, credOpts...)
 	}
 
 	client, err := storage.NewClient(ctx, opts...)
